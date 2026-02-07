@@ -1,6 +1,6 @@
 """
 src/train_advanced.py
-Advanced training pipeline with Leakage Fix, Time-Series CV, and Feature Importance.
+Fixed Version: Uses fillna(0) instead of dropna() to prevent empty output.
 """
 import pandas as pd
 import numpy as np
@@ -31,28 +31,32 @@ def prepare_data(feature_path, label_path=None, is_training=True):
     
     # --- CRITICAL FIX: LAG FEATURES ---
     # We shift features down by 1 row so row T has data from T-1.
-    # This ensures we use YESTERDAY'S Close to predict TODAY'S Return.
     time_col = df_feat['time']
-    # Drop time, shift everything else, then put time back
     df_feat_lagged = df_feat.drop(columns=['time']).shift(1)
     df_feat_lagged['time'] = time_col
     
-    # If this is for prediction (OOS), we just return the features
-    if not is_training:
-        return df_feat_lagged.dropna()
+    # --- BUG FIX: FILL MISSING VALUES ---
+    # Instead of dropping rows with missing data (which wipes out the file),
+    # we fill them with 0. 
+    # We only drop the very first row (index 0) because the shift made it pure NaN.
+    df_feat_lagged = df_feat_lagged.iloc[1:] # Drop first row only
+    df_feat_lagged = df_feat_lagged.fillna(0) # Fill gaps with 0
 
-    # If this is for training (IS), we merge with labels
+    # If this is for prediction (OOS), return features
+    if not is_training:
+        return df_feat_lagged
+
+    # If this is for training (IS), merge with labels
     if label_path:
         df_label = pd.read_csv(label_path)
         # Inner merge aligns the lagged features with the target
-        # Automatically drops the first row (NaN) because it has no label
-        df_merged = pd.merge(df_feat_lagged, df_label, on='time').dropna()
+        df_merged = pd.merge(df_feat_lagged, df_label, on='time')
         return df_merged
     
     return None
 
 def get_feature_importance(model, feature_names, model_name):
-    """Extracts and plots feature importance for the report."""
+    """Extracts and plots feature importance."""
     if hasattr(model, 'coef_'): # Ridge/Lasso
         importances = model.coef_
     elif hasattr(model, 'feature_importances_'): # Random Forest
@@ -62,8 +66,6 @@ def get_feature_importance(model, feature_names, model_name):
         
     # Create DataFrame
     feat_imp = pd.DataFrame({'feature': feature_names, 'importance': importances})
-    
-    # Sort by absolute value to see what matters most
     feat_imp['abs_importance'] = feat_imp['importance'].abs()
     feat_imp = feat_imp.sort_values('abs_importance', ascending=False).head(20)
     
@@ -89,12 +91,11 @@ def run_training(model_type="ridge"):
     y_train = train_data['label']
     feature_names = X_train.columns
     
-    # 3. Scale Data (Fit on Training Data Only)
+    # 3. Scale Data
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     
-    # 4. Hyperparameter Tuning (TimeSeries Cross-Validation)
-    # The brief demands "Expanding or rolling window" validation
+    # 4. Hyperparameter Tuning
     tscv = TimeSeriesSplit(n_splits=5)
     
     if model_type == "ridge":
@@ -119,19 +120,22 @@ def run_training(model_type="ridge"):
     # A) In-Sample
     pred_is = best_model.predict(X_train_scaled)
     
-    # B) Out-of-Sample (Strict Separation)
+    # B) Out-of-Sample
     print("Loading OOS features for prediction...")
-    # Load raw OOS features, apply lag, but DO NOT use for training
     oos_features = prepare_data(FEATURE_OOS, is_training=False)
     X_oos = oos_features.drop(columns=['time'])
     
-    # Apply the scaler we learned from training data (no peeking)
+    # Apply Scaler
     X_oos_scaled = scaler.transform(X_oos)
     pred_oos = best_model.predict(X_oos_scaled)
     
     # 6. Save Predictions
     pd.DataFrame({'time': train_data['time'], 'signal': pred_is}).to_csv(OUTPUT_DIR / "pred_is.csv", index=False)
+    
+    # Ensure OOS length matches
+    print(f"Generated {len(pred_oos)} predictions for OOS.")
     pd.DataFrame({'time': oos_features['time'], 'signal': pred_oos}).to_csv(OUTPUT_DIR / "pred_oos.csv", index=False)
+    
     print("Saved predictions.")
     
     # 7. Analyze Features
