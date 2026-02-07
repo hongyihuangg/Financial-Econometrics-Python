@@ -1,16 +1,16 @@
 {
-  "avg_trade_return": 0.0012124496074308229,
-  "total_trade_return": 0.41757681581915573,
-  "long_avg": 0.0018306717587754941,
-  "long_total": 0.4950112654798213,
-  "short_avg": 0.0005942274560861514,
-  "short_total": -0.05179522820238702,
+  "avg_trade_return": 0.019752776649682863,
+  "total_trade_return": 0.16781551673534967,
+  "long_avg": 0.014204720627481238,
+  "long_total": 0.02857392226233091,
+  "short_avg": 0.021602128657083403,
+  "short_total": 0.13537344420200692,
   "avg_holding_days": 1.0,
-  "win_rate": 0.4851190476190476,
-  "payoff_ratio": 1.1743556181211376,
+  "win_rate": 1.0,
+  "payoff_ratio": NaN,
   "compounded": true,
-  "mean_daily": 9.4858767198677e-05,
-  "std_daily": 0.016919239994603923,
-  "sharpe": 0.10711321568101852,
-  "max_drawdown": -0.6354323040388956
+  "mean_daily": 4.65011035182895e-05,
+  "std_daily": 0.0012878622484717042,
+  "sharpe": 0.6898271428934412,
+  "max_drawdown": 0.0
 }
