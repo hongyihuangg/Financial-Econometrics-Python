@@ -14,7 +14,7 @@ PRED_OOS = OUTPUT_DIR / "pred_oos.csv"
 RISK_REPORT = OUTPUT_DIR / "risk_report.png"
 
 # Settings
-STOP_LOSS_PCT = 0.02
+STOP_LOSS_PCT = 0.01
 VIX_THRESHOLD = 25.0
 
 def apply_risk_management():
