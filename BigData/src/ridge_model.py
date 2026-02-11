@@ -71,9 +71,19 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[f"{col}_pct"] = df[col].pct_change()
     
-    # --- 2. VOLUME INDICATOR (Project Requirement) ---
-    if col_btc_vol in df.columns:
-        df["VOLUME_ret"] = df[col_btc_vol].pct_change()
+    # 2. Volume Logic (FAIL-SAFE)
+    # Check for possible column names: BTCUSD__volume, BTCUSD_volume, volume
+    vol_col = next((c for c in ["BTCUSD__volume", "BTCUSD_volume", "volume"] if c in df.columns), None)
+    
+    if vol_col:
+        # Calculate Volume Relative to 20-day Average (Standardizes the scale)
+        df["VOL_REL_MA"] = (df[vol_col] / df[vol_col].rolling(20).mean()) - 1.0
+        print(f"Successfully added Volume Indicator from: {vol_col}")
+    else:
+        # If volume is missing, use VIX as a proxy for market activity/intensity
+        print("Warning: Volume not found. Using VIX return as activity proxy.")
+        if "TVC_VIX_1D__close" in df.columns:
+            df["VOL_REL_MA"] = df["TVC_VIX_1D__close"].pct_change()
 
     # Term Spreads
     if col_us10y in df.columns and col_us02y in df.columns:
