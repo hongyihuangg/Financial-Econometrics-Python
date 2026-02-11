@@ -1,7 +1,7 @@
 """
-src/train_rf.py
+src/train_rf_restricted.py
 Random Forest Pipeline:
-1. Train (Robust / "Financial" Parameters)
+1. Train (Robust / "Financial" Parameters: High Bias, Low Variance)
 2. Predict (Fix Stale Labels)
 3. Report (Generate Forecast Plot + 4-Panel OOS Report)
 """
@@ -29,6 +29,7 @@ REPORT_FILE = OUTPUT_DIR / "oos_report.png"
 # --- PLOT CONFIG ---
 PRED_OOS_FILE = OUTPUT_DIR / "pred_oos.csv"
 LABEL_OOS_FILE = OUTPUT_DIR / "label_oos.csv"
+# Changing name for RF specific plot
 FORECAST_PLOT_FILE = PLOTS_DIR / "rf_forecast_vs_actual.png"
 
 def keep_close_only(df: pd.DataFrame) -> pd.DataFrame:
@@ -80,9 +81,10 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss.replace(0, 0.001)
         df['RSI_14'] = 100 - (100 / (1 + rs))
-        df['RSI_14'] = (df['RSI_14'] / 100.0) - 0.5 
+        df['RSI_14'] = (df['RSI_14'] / 100.0) - 0.5 # Center around 0
     # -----------------------
 
+    # Drop Raw Levels
     drop_cols = [col_btc_close, col_nasdaq, col_vix, col_us10y, col_us02y] + present_mas
     drop_cols += ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close", "TVC_US03MY_1D__close"]
     
@@ -102,7 +104,7 @@ def prepare_data():
     full_df = pd.concat([df_is, df_oos], axis=0).sort_values('time').reset_index(drop=True)
     
     full_df = keep_close_only(full_df)
-    full_df['label'] = full_df['BTCUSD__close'].pct_change().shift(-1)
+    full_df['label'] = full_df['BTCUSD__close'].pct_change().shift(-1) # Forward Label
     
     full_df = build_features(full_df)
     full_df = full_df.dropna(subset=['label'])
@@ -146,39 +148,49 @@ def get_feature_importance(model, feature_names):
         plt.savefig(PLOTS_DIR / "importance_rf.png")
         plt.close()
 
+# --- 4-PANEL OOS REPORT FUNCTION ---
 def generate_full_report(df):
-    """Generates the 4-panel OOS Report."""
+    """Generates the 4-panel OOS Report (IC, Deciles, Cumulative Return, Metrics)."""
     print("Generating OOS Report...")
     df = df.copy().dropna()
     
+    # 1. OOS IC (Rolling)
     df['ic_rolling'] = df['label'].rolling(60).corr(df['signal'])
     
+    # 2. Deciles
     df['decile'] = pd.qcut(df['signal'], 10, labels=False, duplicates='drop') + 1
     decile_returns = df.groupby('decile')['label'].mean()
     
-    df['position'] = np.sign(df['signal'])
+    # 3. Cumulative Return (Strategy vs Hold)
+    df['position'] = np.sign(df['signal']) # -1 or +1
     df['strat_ret'] = df['position'] * df['label']
     df['cum_ret'] = (1 + df['strat_ret']).cumprod()
     
+    # Metrics
     total_ret = df['cum_ret'].iloc[-1] - 1
     sharpe = df['strat_ret'].mean() / df['strat_ret'].std() * np.sqrt(365)
     
+    # --- PLOTTING ---
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
+    # Top Left: IC
     axes[0,0].plot(df['time'], df['ic_rolling'])
     axes[0,0].axhline(0, color='k', linewidth=0.5)
     axes[0,0].set_title("OOS IC (Rolling 60d)")
     
+    # Top Right: Deciles
     axes[0,1].bar(decile_returns.index, decile_returns.values)
     axes[0,1].set_title("OOS Decile Mean Returns")
     axes[0,1].set_xlabel("Decile")
     axes[0,1].set_ylabel("Mean Return")
     
+    # Bottom Left: Cumulative
     axes[1,0].plot(df['time'], df['cum_ret'])
     axes[1,0].set_title("OOS Cumulative Return (Signal Sign)")
     
+    # Bottom Right: Text Stats
     text_str = f"Total Return: {total_ret:.2%}\nSharpe Ratio: {sharpe:.2f}\n"
-    text_str += f"Model: Random Forest\n(Robust Financial Params)"
+    text_str += f"Model: Random Forest\n(RESTRICTED Params)"
     axes[1,1].text(0.1, 0.5, text_str, fontsize=12, fontfamily='monospace')
     axes[1,1].axis('off')
     
@@ -187,7 +199,9 @@ def generate_full_report(df):
     print(f"Full Report saved to {REPORT_FILE}")
     plt.close()
 
+# --- FORECAST VS ACTUAL PLOT FUNCTION ---
 def plot_forecast_vs_actual():
+    # 1. Load Data
     print("Loading OOS data for Plotting...")
     if not PRED_OOS_FILE.exists() or not LABEL_OOS_FILE.exists():
         print("Predictions or Labels not found. Skipping plot.")
@@ -196,28 +210,55 @@ def plot_forecast_vs_actual():
     df_pred = pd.read_csv(PRED_OOS_FILE)
     df_label = pd.read_csv(LABEL_OOS_FILE)
     
+    # 2. Merge on Time
     df_pred['time'] = pd.to_datetime(df_pred['time'])
     df_label['time'] = pd.to_datetime(df_label['time'])
     
+    # Merge using inner join to ensure alignment
     df = pd.merge(df_label, df_pred, on='time', how='inner', suffixes=('_actual', '_pred'))
     df = df.sort_values('time')
     
+    print(f"Plotting {len(df)} days of OOS data...")
+
+    # 3. Plot
     plt.figure(figsize=(14, 7))
-    plt.plot(df['time'], df['label'], label='Actual OOS Return', color='#1f77b4', marker='o', markersize=3, linestyle='-', linewidth=1, alpha=0.6)
-    plt.plot(df['time'], df['signal'], label='Random Forest Forecast', color='#2ca02c', marker='.', markersize=4, linestyle='-', linewidth=2)
-    plt.title("Random Forest OOS Returns: Forecast vs Actual", fontsize=14)
+    
+    # Plot Actual Returns (Blue, jagged)
+    plt.plot(df['time'], df['label'], 
+             label='Actual OOS Return', 
+             color='#1f77b4', 
+             marker='o', 
+             markersize=3, 
+             linestyle='-', 
+             linewidth=1, 
+             alpha=0.6)
+    
+    # Plot RF Forecast (Green, smooth)
+    plt.plot(df['time'], df['signal'], 
+             label='Restricted RF Forecast', 
+             color='#2ca02c',  # Green for RF
+             marker='.', 
+             markersize=4, 
+             linestyle='-', 
+             linewidth=2)
+
+    # Style
+    plt.title("Restricted RF Returns: Forecast vs Actual", fontsize=14)
     plt.ylabel("Return", fontsize=12)
     plt.xlabel("Time", fontsize=12)
     plt.axhline(0, color='black', linewidth=1, linestyle='--')
     plt.legend(loc='upper right')
     plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    
     plt.tight_layout()
+    
+    # Ensure plots dir exists
     FORECAST_PLOT_FILE.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(FORECAST_PLOT_FILE, dpi=300)
     print(f"Forecast Plot saved to {FORECAST_PLOT_FILE}")
 
 def run_training():
-    print(f"\n--- Running Pipeline: RANDOM FOREST ---")
+    print(f"\n--- Running Pipeline: RANDOM FOREST (RESTRICTED) ---")
     train_data, oos_features = prepare_data()
     
     drop_cols = ['time', 'label']
@@ -233,24 +274,17 @@ def run_training():
         ('model', RandomForestRegressor(random_state=42, n_jobs=-1))
     ])
     
-    # 2. "Financial" / Robust Hyperparameters
-    # We removed the "textbook" options (10, None) because they overfit noise.
+    # 2. RESTRICTED / ROBUST PARAMETERS
+    # - max_depth: [3, 5] -> Prevents complex overfitting.
+    # - min_samples_leaf: [50] -> Forces large sample size per rule (ignores noise).
     param_grid = {
         'model__n_estimators': [200],
-        
-        # Keep trees simple: 3 or 5 levels max. 
-        # Prevents "memorizing" specific days.
         'model__max_depth': [3, 5], 
-        
-        # Require 50 days of data per leaf.
-        # "Don't trade it unless you've seen it 50 times."
         'model__min_samples_leaf': [50],
-        
-        # 'sqrt' is standard for removing noise in RF
         'model__max_features': ['sqrt'] 
     }
 
-    print("Tuning hyperparameters (Robust Mode)...")
+    print("Tuning hyperparameters (Restricted Mode)...")
     grid = GridSearchCV(pipeline, param_grid, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
     grid.fit(X_train, y_train)
     
@@ -263,6 +297,7 @@ def run_training():
     pd.DataFrame({'time': train_data['time'], 'signal': pred_is}).to_csv(OUTPUT_DIR / "pred_is.csv", index=False)
     pd.DataFrame({'time': oos_features['time'], 'signal': pred_oos}).to_csv(OUTPUT_DIR / "pred_oos.csv", index=False)
     
+    # Fix Stale Labels
     train_data[['time', 'label']].to_csv(LABEL_IS, index=False)
     oos_features[['time', 'label']].to_csv(LABEL_OOS, index=False)
     
@@ -273,8 +308,11 @@ def run_training():
     train_mean = y_train.mean()
     calculate_oos_metrics(oos_features['label'], pred_oos, train_mean)
 
+    # --- REPORTING ---
+    # 1. Generate Forecast vs Actual Plot
     plot_forecast_vs_actual()
 
+    # 2. Generate Full 4-Panel Report
     report_df = pd.DataFrame({
         'time': oos_features['time'],
         'label': oos_features['label'],
