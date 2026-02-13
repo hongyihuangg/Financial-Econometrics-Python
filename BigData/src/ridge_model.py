@@ -295,10 +295,18 @@ def run_training():
     pred_is = best_model.predict(X_train)
     pred_oos = best_model.predict(X_oos)
     
-    # Save to Ridge-specific files
-    pd.DataFrame({'time': train_data['time'], 'signal': pred_is}).to_csv(OUTPUT_DIR / "pred_is_ridge.csv", index=False)
+    # 1. SAVE PREDICTIONS (OVERWRITE STANDARD FILES)
+    # Changed "pred_is_ridge.csv" -> "pred_is.csv" so backtester finds it automatically
+    pd.DataFrame({'time': train_data['time'], 'signal': pred_is}).to_csv(OUTPUT_DIR / "pred_is.csv", index=False)
     pd.DataFrame({'time': oos_features['time'], 'signal': pred_oos}).to_csv(PRED_OOS_FILE, index=False)
     
+    # 2. OVERWRITE LABELS (CRITICAL FIX)
+    # This aligns the label files with the prediction files (dropping any NaNs from feature engineering)
+    # If you skip this, the backtester might crash due to "Length Mismatch"
+    train_data[['time', 'label']].to_csv(LABEL_IS, index=False)
+    oos_features[['time', 'label']].to_csv(LABEL_OOS, index=False)
+    
+    print(f"Success! Overwrote pred_is.csv, pred_oos.csv and aligned Label files.")
     print(f"Success! Predictions saved.")
     
     get_feature_importance(best_model, feature_names)

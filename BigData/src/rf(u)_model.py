@@ -38,30 +38,42 @@ def keep_close_only(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=drop_cols, errors="ignore")
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    print("--- Engineering Features ---")
+    print("--- Engineering Features (Robust Volume + Weekend Fill) ---")
     df = df.copy()
-    df = df.ffill()
     
+    # 1. Targeted Forward Fill (TradFi only) - Fixes the Weekend Gap
+    tradfi_cols = ["IG_NASDAQ_1D__close", "TVC_VIX_1D__close", "TVC_US10Y_1D__close", 
+                   "TVC_US02Y_1D__close", "ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"]
+    present_tradfi = [c for c in tradfi_cols if c in df.columns]
+    df[present_tradfi] = df[present_tradfi].ffill()
+
+    # 2. Volume Logic (FAIL-SAFE) - Adds the missing Volume Feature
+    vol_col = next((c for c in ["BTCUSD__volume", "BTCUSD_volume", "volume"] if c in df.columns), None)
+    
+    if vol_col:
+        # Calculate Volume Relative to 20-day Average
+        df["VOL_REL_MA"] = (df[vol_col] / df[vol_col].rolling(20).mean()) - 1.0
+        print(f"Successfully added Volume Indicator from: {vol_col}")
+    else:
+        print("Warning: Volume not found. Using VIX return as activity proxy.")
+        if "TVC_VIX_1D__close" in df.columns:
+            df["VOL_REL_MA"] = df["TVC_VIX_1D__close"].pct_change()
+    
+    # 3. Standard Indicators (Your original logic starts here)
     col_btc_close = "BTCUSD__close"
-    col_nasdaq = "IG_NASDAQ_1D__close"
-    col_vix = "TVC_VIX_1D__close"
-    col_us10y = "TVC_US10Y_1D__close"
-    col_us02y = "TVC_US02Y_1D__close"
+    if "IG_NASDAQ_1D__close" in df.columns:
+        df["NASDAQ_ret"] = df["IG_NASDAQ_1D__close"].pct_change()
     
-    # Returns
-    if col_nasdaq in df.columns:
-        df["NASDAQ_ret"] = df[col_nasdaq].pct_change()
-    if col_vix in df.columns:
-        df["VIX_ret"] = df[col_vix].pct_change()
+    if "TVC_VIX_1D__close" in df.columns:
+        df["VIX_ret"] = df["TVC_VIX_1D__close"].pct_change()
+
     for col in ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"]:
         if col in df.columns:
             df[f"{col}_pct"] = df[col].pct_change()
 
-    # Term Spreads
-    if col_us10y in df.columns and col_us02y in df.columns:
-        df["TERM_10Y_2Y"] = df[col_us10y] - df[col_us02y]
+    if "TVC_US10Y_1D__close" in df.columns and "TVC_US02Y_1D__close" in df.columns:
+        df["TERM_10Y_2Y"] = df["TVC_US10Y_1D__close"] - df["TVC_US02Y_1D__close"]
     
-    # Technicals
     ma_cols = ["BTCUSD__MA", "BTCUSD__MA.1", "BTCUSD__MA.2", "BTCUSD__MA.3", "BTCUSD__MA.4"]
     present_mas = [c for c in ma_cols if c in df.columns]
     
@@ -74,21 +86,21 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             long_ma = present_mas[-1]
             df["TREND_SLOPE"] = (df[short_ma] - df[long_ma]) / df[col_btc_close]
 
-    # --- RSI CALCULATION ---
+    # RSI
     if col_btc_close in df.columns:
         delta = df[col_btc_close].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss.replace(0, 0.001)
-        df['RSI_14'] = 100 - (100 / (1 + rs))
-        df['RSI_14'] = (df['RSI_14'] / 100.0) - 0.5 # Center around 0
-    # -----------------------
+        df['RSI_14'] = (100 - (100 / (1 + rs))) / 100.0 - 0.5 
 
-    # Drop Raw Levels
-    drop_cols = [col_btc_close, col_nasdaq, col_vix, col_us10y, col_us02y] + present_mas
-    drop_cols += ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close", "TVC_US03MY_1D__close"]
+    df = df.ffill().fillna(0)
     
-    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+    # Drop raw levels so model doesn't overfit price level
+    # Added vol_col to this list so raw volume doesn't leak in
+    drop_raw = [col_btc_close, vol_col] + present_tradfi
+    df = df.drop(columns=[c for c in drop_raw if c in df.columns], errors="ignore")
+    
     return df
 
 def prepare_data():
