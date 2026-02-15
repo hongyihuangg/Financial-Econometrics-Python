@@ -1,9 +1,10 @@
 """
-src/train_rf.py
-Random Forest Pipeline:
-1. Train (Theory-Aligned Parameters + RSI)
-2. Predict (Fix Stale Labels)
-3. Report (Generate Forecast Plot + 4-Panel OOS Report)
+src/train_rf_restricted.py
+Random Forest Pipeline (Restricted):
+1. Loads Data (Features from 'data/', Labels from 'data/')
+2. Engineers Features (RSI, Volume, Weekend Fill)
+3. Trains Restricted Random Forest (High Bias / Low Variance)
+4. Saves to 'outputs/pred_result/' for Batch Backtest
 """
 import pandas as pd
 import numpy as np
@@ -16,21 +17,22 @@ from sklearn.pipeline import Pipeline
 from pathlib import Path
 
 # --- CONFIGURATION ---
+DATA_DIR = Path("data")       # Inputs are now in 'data/'
 OUTPUT_DIR = Path("outputs")
+PRED_RESULT_DIR = OUTPUT_DIR / "pred_result" # New folder for backtest predictions
+PRED_RESULT_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR = OUTPUT_DIR / "plots"
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-FEATURE_IS = OUTPUT_DIR / "feature_is.csv"
-FEATURE_OOS = OUTPUT_DIR / "feature_oos.csv"
-LABEL_IS = OUTPUT_DIR / "label_is.csv"
-LABEL_OOS = OUTPUT_DIR / "label_oos.csv"
-REPORT_FILE = OUTPUT_DIR / "oos_report.png" 
+# Inputs (Read from DATA_DIR)
+FEATURE_IS = DATA_DIR / "feature_is.csv"
+FEATURE_OOS = DATA_DIR / "feature_oos.csv"
+LABEL_IS = DATA_DIR / "label_is.csv"
+LABEL_OOS = DATA_DIR / "label_oos.csv"
 
-# --- PLOT CONFIG ---
-PRED_OOS_FILE = OUTPUT_DIR / "pred_oos.csv"
-LABEL_OOS_FILE = OUTPUT_DIR / "label_oos.csv"
-# Changing name and folder for RF specific plot
-FORECAST_PLOT_FILE = PLOTS_DIR / "rf_forecast_vs_actual.png"
+# Report Output
+REPORT_FILE = OUTPUT_DIR / "oos_report_restricted.png" 
+FORECAST_PLOT_FILE = PLOTS_DIR / "rf_restricted_forecast_vs_actual.png"
 
 def keep_close_only(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -38,42 +40,52 @@ def keep_close_only(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=drop_cols, errors="ignore")
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    print("--- Engineering Features (Robust Volume + Weekend Fill) ---")
+    print("--- Engineering Features ---")
     df = df.copy()
     
-    # 1. Targeted Forward Fill (TradFi only) - Fixes the Weekend Gap
-    tradfi_cols = ["IG_NASDAQ_1D__close", "TVC_VIX_1D__close", "TVC_US10Y_1D__close", 
-                   "TVC_US02Y_1D__close", "ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"]
+    # --- 1. TARGETED FORWARD FILL (Weekend Handling) ---
+    tradfi_cols = [
+        "IG_NASDAQ_1D__close", "TVC_VIX_1D__close", 
+        "TVC_US10Y_1D__close", "TVC_US02Y_1D__close",
+        "ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"
+    ]
     present_tradfi = [c for c in tradfi_cols if c in df.columns]
     df[present_tradfi] = df[present_tradfi].ffill()
-
-    # 2. Volume Logic (FAIL-SAFE) - Adds the missing Volume Feature
+    
+    # General ffill
+    df = df.ffill()
+    
+    col_btc_close = "BTCUSD__close"
+    col_nasdaq = "IG_NASDAQ_1D__close"
+    col_vix = "TVC_VIX_1D__close"
+    col_us10y = "TVC_US10Y_1D__close"
+    col_us02y = "TVC_US02Y_1D__close"
+    
+    # Returns
+    if col_nasdaq in df.columns:
+        df["NASDAQ_ret"] = df[col_nasdaq].pct_change()
+    if col_vix in df.columns:
+        df["VIX_ret"] = df[col_vix].pct_change()
+    for col in ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"]:
+        if col in df.columns:
+            df[f"{col}_pct"] = df[col].pct_change()
+    
+    # --- 2. Volume Logic (FAIL-SAFE) ---
     vol_col = next((c for c in ["BTCUSD__volume", "BTCUSD_volume", "volume"] if c in df.columns), None)
     
     if vol_col:
-        # Calculate Volume Relative to 20-day Average
         df["VOL_REL_MA"] = (df[vol_col] / df[vol_col].rolling(20).mean()) - 1.0
         print(f"Successfully added Volume Indicator from: {vol_col}")
     else:
         print("Warning: Volume not found. Using VIX return as activity proxy.")
         if "TVC_VIX_1D__close" in df.columns:
             df["VOL_REL_MA"] = df["TVC_VIX_1D__close"].pct_change()
-    
-    # 3. Standard Indicators (Your original logic starts here)
-    col_btc_close = "BTCUSD__close"
-    if "IG_NASDAQ_1D__close" in df.columns:
-        df["NASDAQ_ret"] = df["IG_NASDAQ_1D__close"].pct_change()
-    
-    if "TVC_VIX_1D__close" in df.columns:
-        df["VIX_ret"] = df["TVC_VIX_1D__close"].pct_change()
 
-    for col in ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"]:
-        if col in df.columns:
-            df[f"{col}_pct"] = df[col].pct_change()
-
-    if "TVC_US10Y_1D__close" in df.columns and "TVC_US02Y_1D__close" in df.columns:
-        df["TERM_10Y_2Y"] = df["TVC_US10Y_1D__close"] - df["TVC_US02Y_1D__close"]
+    # Term Spreads
+    if col_us10y in df.columns and col_us02y in df.columns:
+        df["TERM_10Y_2Y"] = df[col_us10y] - df[col_us02y]
     
+    # Technicals
     ma_cols = ["BTCUSD__MA", "BTCUSD__MA.1", "BTCUSD__MA.2", "BTCUSD__MA.3", "BTCUSD__MA.4"]
     present_mas = [c for c in ma_cols if c in df.columns]
     
@@ -86,21 +98,20 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             long_ma = present_mas[-1]
             df["TREND_SLOPE"] = (df[short_ma] - df[long_ma]) / df[col_btc_close]
 
-    # RSI
+    # --- RSI CALCULATION ---
     if col_btc_close in df.columns:
         delta = df[col_btc_close].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
         rs = gain / loss.replace(0, 0.001)
         df['RSI_14'] = (100 - (100 / (1 + rs))) / 100.0 - 0.5 
+    # -----------------------
 
-    df = df.ffill().fillna(0)
+    # Drop Raw Levels
+    drop_cols = [col_btc_close, col_nasdaq, col_vix, col_us10y, col_us02y] + present_mas
+    drop_cols += ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close", "TVC_US03MY_1D__close"]
     
-    # Drop raw levels so model doesn't overfit price level
-    # Added vol_col to this list so raw volume doesn't leak in
-    drop_raw = [col_btc_close, vol_col] + present_tradfi
-    df = df.drop(columns=[c for c in drop_raw if c in df.columns], errors="ignore")
-    
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
     return df
 
 def prepare_data():
@@ -108,7 +119,7 @@ def prepare_data():
     # Load Features
     df_is = pd.read_csv(FEATURE_IS)
     df_oos = pd.read_csv(FEATURE_OOS)
-    # Load NEW Labels (Intraday Return)
+    # Load Labels
     lbl_is = pd.read_csv(LABEL_IS)
     lbl_oos = pd.read_csv(LABEL_OOS)
     
@@ -116,7 +127,7 @@ def prepare_data():
     for d in [df_is, df_oos, lbl_is, lbl_oos]:
         d['time'] = pd.to_datetime(d['time'])
 
-    # Merge Features + Labels on Time
+    # Merge Features + Labels
     df_is = pd.merge(df_is, lbl_is, on='time', how='inner')
     df_oos = pd.merge(df_oos, lbl_oos, on='time', how='inner')
 
@@ -126,9 +137,9 @@ def prepare_data():
     
     full_df = keep_close_only(full_df)
     
-    # --- CRITICAL UPDATE: Labels are now merged from CSV ---
-    # We DO NOT calculate 'pct_change().shift(-1)' here anymore.
-    # The label column from the CSV is already the correct Intraday Return.
+    # --- FIX DATA LEAKAGE HERE ---
+    print("Applying Shift(-1) to fix detected Data Leakage...")
+    full_df['label'] = full_df['label'].shift(-1)
     
     full_df = build_features(full_df)
     full_df = full_df.dropna(subset=['label'])
@@ -149,10 +160,6 @@ def calculate_oos_metrics(y_true, y_pred, train_mean):
     print(f"\n--- Statistical Performance ---")
     print(f"Model OOS R2:     {oos_r2:.5f}")
     print(f"Benchmark OOS R2: {bench_r2:.5f}")
-    if oos_r2 > bench_r2:
-        print("RESULT: Model BEATS Benchmark!")
-    else:
-        print("RESULT: Model UNDERPERFORMS Benchmark.")
 
 def get_feature_importance(model, feature_names):
     if hasattr(model, 'named_steps'):
@@ -167,54 +174,39 @@ def get_feature_importance(model, feature_names):
         
         plt.figure(figsize=(10, 6))
         sns.barplot(x='importance', y='feature', data=feat_imp, palette='viridis')
-        plt.title('Top 20 Features (Random Forest)')
+        plt.title('Top 20 Features (RF Restricted)')
         plt.tight_layout()
-        plt.savefig(PLOTS_DIR / "importance_rf.png")
+        plt.savefig(PLOTS_DIR / "importance_rf_restricted.png")
         plt.close()
 
-# --- 4-PANEL OOS REPORT FUNCTION ---
 def generate_full_report(df):
-    """Generates the 4-panel OOS Report (IC, Deciles, Cumulative Return, Metrics)."""
     print("Generating OOS Report...")
     df = df.copy().dropna()
     
-    # 1. OOS IC (Rolling)
     df['ic_rolling'] = df['label'].rolling(60).corr(df['signal'])
-    
-    # 2. Deciles
     df['decile'] = pd.qcut(df['signal'], 10, labels=False, duplicates='drop') + 1
     decile_returns = df.groupby('decile')['label'].mean()
     
-    # 3. Cumulative Return (Strategy vs Hold)
-    df['position'] = np.sign(df['signal']) # -1 or +1
+    df['position'] = np.sign(df['signal'])
     df['strat_ret'] = df['position'] * df['label']
     df['cum_ret'] = (1 + df['strat_ret']).cumprod()
     
-    # Metrics
     total_ret = df['cum_ret'].iloc[-1] - 1
     sharpe = df['strat_ret'].mean() / df['strat_ret'].std() * np.sqrt(365)
     
-    # --- PLOTTING ---
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # Top Left: IC
     axes[0,0].plot(df['time'], df['ic_rolling'])
     axes[0,0].axhline(0, color='k', linewidth=0.5)
     axes[0,0].set_title("OOS IC (Rolling 60d)")
     
-    # Top Right: Deciles
     axes[0,1].bar(decile_returns.index, decile_returns.values)
     axes[0,1].set_title("OOS Decile Mean Returns")
-    axes[0,1].set_xlabel("Decile")
-    axes[0,1].set_ylabel("Mean Return")
     
-    # Bottom Left: Cumulative
     axes[1,0].plot(df['time'], df['cum_ret'])
-    axes[1,0].set_title("OOS Cumulative Return (Signal Sign)")
+    axes[1,0].set_title("OOS Cumulative Return")
     
-    # Bottom Right: Text Stats
     text_str = f"Total Return: {total_ret:.2%}\nSharpe Ratio: {sharpe:.2f}\n"
-    text_str += f"Model: Random Forest\n(Theory + RSI)"
+    text_str += f"Model: Random Forest\n(RESTRICTED Params)"
     axes[1,1].text(0.1, 0.5, text_str, fontsize=12, fontfamily='monospace')
     axes[1,1].axis('off')
     
@@ -223,93 +215,34 @@ def generate_full_report(df):
     print(f"Full Report saved to {REPORT_FILE}")
     plt.close()
 
-# --- FORECAST VS ACTUAL PLOT FUNCTION ---
 def plot_forecast_vs_actual():
-    # 1. Load Data
-    print("Loading OOS data for Plotting...")
-    if not PRED_OOS_FILE.exists() or not LABEL_OOS_FILE.exists():
-        print("Predictions or Labels not found. Skipping plot.")
-        return
-
-    df_pred = pd.read_csv(PRED_OOS_FILE)
-    df_label = pd.read_csv(LABEL_OOS_FILE)
-    
-    # 2. Merge on Time
-    df_pred['time'] = pd.to_datetime(df_pred['time'])
-    df_label['time'] = pd.to_datetime(df_label['time'])
-    
-    # Merge using inner join to ensure alignment
-    df = pd.merge(df_label, df_pred, on='time', how='inner', suffixes=('_actual', '_pred'))
-    df = df.sort_values('time')
-    
-    print(f"Plotting {len(df)} days of OOS data...")
-
-    # 3. Plot
-    plt.figure(figsize=(14, 7))
-    
-    # Plot Actual Returns (Blue, jagged)
-    plt.plot(df['time'], df['label'], 
-             label='Actual OOS Return', 
-             color='#1f77b4', 
-             marker='o', 
-             markersize=3, 
-             linestyle='-', 
-             linewidth=1, 
-             alpha=0.6)
-    
-    # Plot RF Forecast (Green, smooth)
-    plt.plot(df['time'], df['signal'], 
-             label='Random Forest Forecast', 
-             color='#2ca02c',  # Green for RF
-             marker='.', 
-             markersize=4, 
-             linestyle='-', 
-             linewidth=2)
-
-    # Style
-    plt.title("Random Forest OOS Returns: Forecast vs Actual", fontsize=14)
-    plt.ylabel("Return", fontsize=12)
-    plt.xlabel("Time", fontsize=12)
-    plt.axhline(0, color='black', linewidth=1, linestyle='--')
-    plt.legend(loc='upper right')
-    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
-    
-    plt.tight_layout()
-    
-    # Ensure plots dir exists
-    FORECAST_PLOT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(FORECAST_PLOT_FILE, dpi=300)
-    print(f"Forecast Plot saved to {FORECAST_PLOT_FILE}")
-    # plt.show() 
+    # Placeholder for plot generation if needed, reliant on memory or loaded frames
+    pass 
 
 def run_training():
-    print(f"\n--- Running Pipeline: RANDOM FOREST ---")
+    print(f"\n--- Running Pipeline: RANDOM FOREST (RESTRICTED) ---")
     train_data, oos_features = prepare_data()
     
-    drop_cols = ['time', 'label']
-    X_train = train_data.drop(columns=drop_cols)
+    X_train = train_data.drop(columns=['time', 'label'])
     y_train = train_data['label']
-    X_oos = oos_features.drop(columns=drop_cols, errors='ignore')
+    X_oos = oos_features.drop(columns=['time', 'label'], errors='ignore')
     feature_names = X_train.columns
     
     tscv = TimeSeriesSplit(n_splits=5)
     
-    # 1. Pipeline: No StandardScaler (Per Lecture 3 Notes)
     pipeline = Pipeline([
         ('model', RandomForestRegressor(random_state=42, n_jobs=-1))
     ])
     
-    # 2. Expanded Param Grid: Tests Theory vs. Reality
-    # - Theory: min_samples_leaf=5-20, max_features=0.33
-    # - Reality: min_samples_leaf=50, max_features='sqrt' (Robust)
+    # RESTRICTED PARAMS
     param_grid = {
         'model__n_estimators': [200],
-        'model__max_depth': [3, 5, 10, None], 
-        'model__min_samples_leaf': [10, 50],
-        'model__max_features': ['sqrt', 0.33] 
+        'model__max_depth': [3, 5], 
+        'model__min_samples_leaf': [50],
+        'model__max_features': ['sqrt'] 
     }
 
-    print("Tuning hyperparameters (Testing Theory vs Robustness)...")
+    print("Tuning hyperparameters (Restricted Mode)...")
     grid = GridSearchCV(pipeline, param_grid, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
     grid.fit(X_train, y_train)
     
@@ -319,25 +252,18 @@ def run_training():
     pred_is = best_model.predict(X_train)
     pred_oos = best_model.predict(X_oos)
     
-    pd.DataFrame({'time': train_data['time'], 'signal': pred_is}).to_csv(OUTPUT_DIR / "pred_is.csv", index=False)
-    pd.DataFrame({'time': oos_features['time'], 'signal': pred_oos}).to_csv(OUTPUT_DIR / "pred_oos.csv", index=False)
+    # --- NEW SAVING LOGIC (outputs/pred_result) ---
+    is_file = PRED_RESULT_DIR / "rf_restricted_pred_is.csv"
+    oos_file = PRED_RESULT_DIR / "rf_restricted_pred_oos.csv"
     
-    # Fix Stale Labels
-    train_data[['time', 'label']].to_csv(LABEL_IS, index=False)
-    oos_features[['time', 'label']].to_csv(LABEL_OOS, index=False)
+    pd.DataFrame({'time': train_data['time'], 'signal': pred_is}).to_csv(is_file, index=False)
+    pd.DataFrame({'time': oos_features['time'], 'signal': pred_oos}).to_csv(oos_file, index=False)
     
-    print(f"Success! Predictions saved.")
+    print(f"Success! Saved predictions to:\n - {is_file}\n - {oos_file}")
     
     get_feature_importance(best_model, feature_names)
-    
-    train_mean = y_train.mean()
-    calculate_oos_metrics(oos_features['label'], pred_oos, train_mean)
+    calculate_oos_metrics(oos_features['label'], pred_oos, y_train.mean())
 
-    # --- REPORTING ---
-    # 1. Generate Forecast vs Actual Plot
-    plot_forecast_vs_actual()
-
-    # 2. Generate Full 4-Panel Report
     report_df = pd.DataFrame({
         'time': oos_features['time'],
         'label': oos_features['label'],
