@@ -1,0 +1,16 @@
+{
+  "avg_trade_return": 0.00392620280211989,
+  "total_trade_return": 0.39940906496914996,
+  "long_avg": 0.004052927416441048,
+  "long_total": 0.20639069481877304,
+  "short_avg": 0.003772322913301342,
+  "short_total": 0.15999656742990087,
+  "avg_holding_days": 0.0,
+  "win_rate": 0.4838709677419355,
+  "payoff_ratio": 1.6613567806401812,
+  "compounded": true,
+  "mean_daily": 0.003712388397073794,
+  "std_daily": 0.024834497988926136,
+  "sharpe": 2.855909580745491,
+  "max_drawdown": -0.16143264941499746
+}

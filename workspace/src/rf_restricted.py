@@ -10,8 +10,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import optuna # Added
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score # Changed GridSearchCV to cross_val_score
 from sklearn.metrics import r2_score
 from sklearn.pipeline import Pipeline
 from pathlib import Path
@@ -219,8 +220,27 @@ def plot_forecast_vs_actual():
     # Placeholder for plot generation if needed, reliant on memory or loaded frames
     pass 
 
+# --- OPTUNA OBJECTIVE FUNCTION ---
+def objective(trial, X, y):
+    # Suggest constraints based on Financial Theory (High Bias to ignore noise)
+    params = {
+        'n_estimators': 200,
+        'max_depth': trial.suggest_int('max_depth', 2, 4),           # Deeply restricted
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 100, 250), # High sample bias
+        'max_features': trial.suggest_float('max_features', 0.1, 0.4)       # Diversify trees
+    }
+    
+    model = RandomForestRegressor(**params, random_state=42, n_jobs=-1)
+    
+    # 5-Fold Time Series CV to prevent leakage
+    tscv = TimeSeriesSplit(n_splits=5)
+    
+    # Minimize Negative MSE (closest proxy to error minimization)
+    scores = cross_val_score(model, X, y, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
+    return scores.mean()
+
 def run_training():
-    print(f"\n--- Running Pipeline: RANDOM FOREST (RESTRICTED) ---")
+    print(f"\n--- Running Pipeline: RANDOM FOREST (BAYESIAN RESTRICTED) ---")
     train_data, oos_features = prepare_data()
     
     X_train = train_data.drop(columns=['time', 'label'])
@@ -228,26 +248,20 @@ def run_training():
     X_oos = oos_features.drop(columns=['time', 'label'], errors='ignore')
     feature_names = X_train.columns
     
-    tscv = TimeSeriesSplit(n_splits=5)
+    # 1. OPTUNA BAYESIAN SEARCH
+    print("Starting Optuna Study (50 trials)...")
+    optuna.logging.set_verbosity(optuna.logging.WARNING) # Reduce noise
+    study = optuna.create_study(direction='maximize') # maximize neg_mse (closest to 0)
+    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=50)
     
-    pipeline = Pipeline([
-        ('model', RandomForestRegressor(random_state=42, n_jobs=-1))
-    ])
+    print(f"Best Params: {study.best_params}") 
     
-    # RESTRICTED PARAMS
-    param_grid = {
-        'model__n_estimators': [200],
-        'model__max_depth': [3, 5], 
-        'model__min_samples_leaf': [50],
-        'model__max_features': ['sqrt'] 
-    }
-
-    print("Tuning hyperparameters (Restricted Mode)...")
-    grid = GridSearchCV(pipeline, param_grid, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
-    grid.fit(X_train, y_train)
+    # 2. TRAIN BEST MODEL
+    best_params = study.best_params
+    best_params['n_estimators'] = 200 # Ensure n_estimators is passed
     
-    best_model = grid.best_estimator_
-    print(f"Best Params: {grid.best_params_}") 
+    best_model = RandomForestRegressor(**best_params, random_state=42, n_jobs=-1)
+    best_model.fit(X_train, y_train)
     
     pred_is = best_model.predict(X_train)
     pred_oos = best_model.predict(X_oos)
