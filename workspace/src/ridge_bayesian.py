@@ -4,7 +4,8 @@ Ridge Regression Pipeline with BAYESIAN OPTIMIZATION (Optuna):
 1. Loads Data & Fixes Labels (Shift -1)
 2. Engineers Features
 3. Optimizes Alpha using Optuna (TPE Sampler)
-4. Saves Best Model Predictions for Backtest
+4. Trains Final Model & Generates Coefficient Plot
+5. Saves Best Model Predictions for Backtest
 """
 import pandas as pd
 import numpy as np
@@ -37,6 +38,8 @@ LABEL_OOS = DATA_DIR / "label_oos.csv"
 # Outputs
 REPORT_FILE = OUTPUT_DIR / "oos_report_ridge_bayes.png"
 FORECAST_PLOT_FILE = PLOTS_DIR / "ridge_bayes_forecast.png"
+# --- FIX 1: Defined the missing variable here ---
+COEFF_PLOT_FILE = PLOTS_DIR / "ridge_bayes_coefficients.png" 
 
 # Setup Logging for Optuna
 optuna.logging.set_verbosity(optuna.logging.INFO)
@@ -124,6 +127,40 @@ def prepare_data():
     test_df = full_df[full_df['split'] == 'test'].drop(columns=['split']).copy()
     return train_df, test_df
 
+# --- PLOTTING FUNCTION ---
+def plot_coefficients(pipeline, feature_names):
+    """Generates and saves a bar chart of the top 20 Ridge coefficients."""
+    # Extract the Ridge model from the pipeline
+    model = pipeline.named_steps['model']
+    
+    # Create DataFrame for plotting
+    coefs = pd.DataFrame({
+        'Feature': feature_names,
+        'Coefficient': model.coef_,
+        'Abs_Coefficient': np.abs(model.coef_)
+    })
+    
+    # Sort by absolute impact and take top 20
+    coefs = coefs.sort_values('Abs_Coefficient', ascending=False).head(20)
+    
+    plt.figure(figsize=(12, 8))
+    # Color: Blue for Buy (Positive), Red for Sell (Negative)
+    colors = ['#1f77b4' if c > 0 else '#d62728' for c in coefs['Coefficient']]
+    
+    # --- FIX 2: Added hue='Feature' and legend=False to fix Seaborn warning ---
+    sns.barplot(x='Coefficient', y='Feature', data=coefs, hue='Feature', palette=colors, legend=False)
+    
+    plt.title('Top 20 Ridge Coefficients (Bayesian Optimized)', fontsize=14)
+    plt.xlabel('Coefficient Value (Impact Direction)', fontsize=12)
+    plt.ylabel('Feature', fontsize=12)
+    plt.axvline(0, color='black', linewidth=0.8, linestyle='--')
+    plt.grid(axis='x', linestyle=':', alpha=0.6)
+    plt.tight_layout()
+    
+    plt.savefig(COEFF_PLOT_FILE, dpi=300)
+    print(f"Coefficient Plot saved to {COEFF_PLOT_FILE}")
+    plt.close()
+
 # --- OPTUNA OBJECTIVE FUNCTION ---
 def objective(trial, X, y):
     # Suggest an alpha value. Log=True explores 0.001 and 0.1 as equally "distant" as 1 and 100
@@ -170,6 +207,9 @@ def run_bayesian_optimization():
         ('model', Ridge(alpha=best_alpha))
     ])
     final_pipeline.fit(X_train, y_train)
+    
+    # --- NEW: Generate Coefficient Plot ---
+    plot_coefficients(final_pipeline, X_train.columns)
     
     # 4. Predict
     pred_is = final_pipeline.predict(X_train)
