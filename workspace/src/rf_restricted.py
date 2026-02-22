@@ -1,31 +1,30 @@
 """
 src/train_rf_restricted.py
 Random Forest Pipeline (Restricted):
-1. Loads Data (Features from 'data/', Labels from 'data/')
-2. Engineers Features (RSI, Volume, Weekend Fill)
-3. Trains Restricted Random Forest (High Bias / Low Variance)
+1. Loads Data & Fixes Labels (Shift -1)
+2. Engineers Features (Weekends Removed, RSI, Macro Pct, Intermediate MA Slopes)
+3. Trains Restricted Random Forest (High Bias / Low Variance, Seed 42)
 4. Saves to 'outputs/pred_result/' for Batch Backtest
 """
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import optuna # Added
+import optuna 
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import TimeSeriesSplit, cross_val_score # Changed GridSearchCV to cross_val_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score 
 from sklearn.metrics import r2_score
-from sklearn.pipeline import Pipeline
 from pathlib import Path
 
 # --- CONFIGURATION ---
-DATA_DIR = Path("data")       # Inputs are now in 'data/'
+DATA_DIR = Path("data")       
 OUTPUT_DIR = Path("outputs")
-PRED_RESULT_DIR = OUTPUT_DIR / "pred_result" # New folder for backtest predictions
+PRED_RESULT_DIR = OUTPUT_DIR / "pred_result" 
 PRED_RESULT_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR = OUTPUT_DIR / "plots"
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Inputs (Read from DATA_DIR)
+# Inputs 
 FEATURE_IS = DATA_DIR / "feature_is.csv"
 FEATURE_OOS = DATA_DIR / "feature_oos.csv"
 LABEL_IS = DATA_DIR / "label_is.csv"
@@ -41,94 +40,87 @@ def keep_close_only(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=drop_cols, errors="ignore")
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    print("--- Engineering Features ---")
+    print("--- Engineering Features (Merged Logic) ---")
     df = df.copy()
     
-    # --- 1. TARGETED FORWARD FILL (Weekend Handling) ---
+    # 1. Forward Fill TradFi
     tradfi_cols = [
         "IG_NASDAQ_1D__close", "TVC_VIX_1D__close", 
-        "TVC_US10Y_1D__close", "TVC_US02Y_1D__close",
+        "TVC_US10Y_1D__close", "TVC_US02Y_1D__close", "TVC_US03MY_1D__close",
         "ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"
     ]
     present_tradfi = [c for c in tradfi_cols if c in df.columns]
     df[present_tradfi] = df[present_tradfi].ffill()
-    
-    # General ffill
     df = df.ffill()
     
     col_btc_close = "BTCUSD__close"
-    col_nasdaq = "IG_NASDAQ_1D__close"
-    col_vix = "TVC_VIX_1D__close"
-    col_us10y = "TVC_US10Y_1D__close"
-    col_us02y = "TVC_US02Y_1D__close"
     
-    # Returns
-    if col_nasdaq in df.columns:
-        df["NASDAQ_ret"] = df[col_nasdaq].pct_change()
-    if col_vix in df.columns:
-        df["VIX_ret"] = df[col_vix].pct_change()
-    for col in ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"]:
-        if col in df.columns:
-            df[f"{col}_pct"] = df[col].pct_change()
+    # 2. Returns & Macro Changes
+    if "IG_NASDAQ_1D__close" in df.columns: 
+        df["NASDAQ_ret"] = df["IG_NASDAQ_1D__close"].pct_change()
+    if "TVC_VIX_1D__close" in df.columns: 
+        df["VIX_ret"] = df["TVC_VIX_1D__close"].pct_change()
+    if "ECONOMICS_USCBBS_1D__close" in df.columns:
+        df["USCBBS_change"] = df["ECONOMICS_USCBBS_1D__close"].pct_change()
+    if "FRED_M2SL_1D__close" in df.columns:
+        df["M2SL_change"] = df["FRED_M2SL_1D__close"].pct_change()
     
-    # --- 2. Volume Logic (FAIL-SAFE) ---
+    # 3. Volume
     vol_col = next((c for c in ["BTCUSD__volume", "BTCUSD_volume", "volume"] if c in df.columns), None)
-    
     if vol_col:
         df["VOL_REL_MA"] = (df[vol_col] / df[vol_col].rolling(20).mean()) - 1.0
-        print(f"Successfully added Volume Indicator from: {vol_col}")
-    else:
-        print("Warning: Volume not found. Using VIX return as activity proxy.")
-        if "TVC_VIX_1D__close" in df.columns:
-            df["VOL_REL_MA"] = df["TVC_VIX_1D__close"].pct_change()
+    elif "TVC_VIX_1D__close" in df.columns:
+        df["VOL_REL_MA"] = df["TVC_VIX_1D__close"].pct_change()
 
-    # Term Spreads
-    if col_us10y in df.columns and col_us02y in df.columns:
-        df["TERM_10Y_2Y"] = df[col_us10y] - df[col_us02y]
+    # 4. Term Spreads
+    if "TVC_US10Y_1D__close" in df.columns and "TVC_US02Y_1D__close" in df.columns:
+        df["TERM_10Y_2Y"] = df["TVC_US10Y_1D__close"] - df["TVC_US02Y_1D__close"]
+    if "TVC_US10Y_1D__close" in df.columns and "TVC_US03MY_1D__close" in df.columns:
+        df["TERM_10Y_3M"] = df["TVC_US10Y_1D__close"] - df["TVC_US03MY_1D__close"]
     
-    # Technicals
+    # 5. Technicals (Distances & Intermediate Slopes)
     ma_cols = ["BTCUSD__MA", "BTCUSD__MA.1", "BTCUSD__MA.2", "BTCUSD__MA.3", "BTCUSD__MA.4"]
     present_mas = [c for c in ma_cols if c in df.columns]
     
     if col_btc_close in df.columns and present_mas:
         for ma in present_mas:
             df[f"DIST_{ma}"] = (df[col_btc_close] / df[ma]) - 1.0
-        
-        if len(present_mas) >= 2:
-            short_ma = present_mas[0]
-            long_ma = present_mas[-1]
-            df["TREND_SLOPE"] = (df[short_ma] - df[long_ma]) / df[col_btc_close]
+            
+        for i in range(len(present_mas) - 1):
+            short_ma = present_mas[i]
+            long_ma = present_mas[i + 1]
+            df[f"SLOPE_{short_ma}_minus_{long_ma}"] = (df[short_ma] - df[long_ma]) / df[col_btc_close]
 
-    # --- RSI CALCULATION ---
+        if len(present_mas) >= 2:
+            df["TREND_SLOPE_MEGA"] = (df[present_mas[0]] - df[present_mas[-1]]) / df[col_btc_close]
+
+    # 6. RSI
     if col_btc_close in df.columns:
         delta = df[col_btc_close].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss.replace(0, 0.001)
         df['RSI_14'] = (100 - (100 / (1 + rs))) / 100.0 - 0.5 
-    # -----------------------
 
-    # Drop Raw Levels
-    drop_cols = [col_btc_close, col_nasdaq, col_vix, col_us10y, col_us02y] + present_mas
-    drop_cols += ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close", "TVC_US03MY_1D__close"]
+    # 7. Cleanup Raw Columns
+    drop_cols = [col_btc_close] + present_tradfi + present_mas 
+    drop_cols += ["ETHBTC_close", "BTCDOMclose", "CRYPTOCAP_USDT_D_1D_close"] 
     
     df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+    df = df.replace([np.inf, -np.inf], np.nan)
+    
     return df
 
 def prepare_data():
     print("Loading data from data/ folder...")
-    # Load Features
     df_is = pd.read_csv(FEATURE_IS)
     df_oos = pd.read_csv(FEATURE_OOS)
-    # Load Labels
     lbl_is = pd.read_csv(LABEL_IS)
     lbl_oos = pd.read_csv(LABEL_OOS)
     
-    # Time Conversion
     for d in [df_is, df_oos, lbl_is, lbl_oos]:
         d['time'] = pd.to_datetime(d['time'])
 
-    # Merge Features + Labels
     df_is = pd.merge(df_is, lbl_is, on='time', how='inner')
     df_oos = pd.merge(df_oos, lbl_oos, on='time', how='inner')
 
@@ -136,13 +128,13 @@ def prepare_data():
     df_oos['split'] = 'test'
     full_df = pd.concat([df_is, df_oos], axis=0).sort_values('time').reset_index(drop=True)
     
-    # --- NEW: Drop Weekends (Days 5 and 6) ---
+    # --- Drop Weekends ---
     print("Removing weekends to reduce forward-fill drag...")
     full_df = full_df[full_df['time'].dt.dayofweek < 5].reset_index(drop=True)
     
     full_df = keep_close_only(full_df)
     
-    # --- FIX DATA LEAKAGE HERE ---
+    # --- FIX DATA LEAKAGE ---
     print("Applying Shift(-1) to fix detected Data Leakage...")
     full_df['label'] = full_df['label'].shift(-1)
     
@@ -221,25 +213,19 @@ def generate_full_report(df):
     plt.close()
 
 def plot_forecast_vs_actual():
-    # Placeholder for plot generation if needed, reliant on memory or loaded frames
     pass 
 
 # --- OPTUNA OBJECTIVE FUNCTION ---
 def objective(trial, X, y):
-    # Suggest constraints based on Financial Theory (High Bias to ignore noise)
     params = {
         'n_estimators': 200,
-        'max_depth': trial.suggest_int('max_depth', 2, 4),           # Deeply restricted
-        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 100, 250), # High sample bias
-        'max_features': trial.suggest_float('max_features', 0.1, 0.4)       # Diversify trees
+        'max_depth': trial.suggest_int('max_depth', 2, 4),           
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 100, 250), 
+        'max_features': trial.suggest_float('max_features', 0.1, 0.4)       
     }
     
     model = RandomForestRegressor(**params, random_state=42, n_jobs=-1)
-    
-    # 5-Fold Time Series CV to prevent leakage
     tscv = TimeSeriesSplit(n_splits=5)
-    
-    # Minimize Negative MSE (closest proxy to error minimization)
     scores = cross_val_score(model, X, y, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
     return scores.mean()
 
@@ -252,21 +238,19 @@ def run_training():
     X_oos = oos_features.drop(columns=['time', 'label'], errors='ignore')
     feature_names = X_train.columns
     
-    # 1. OPTUNA BAYESIAN SEARCH
     print("Starting Optuna Study (50 trials)...")
-    optuna.logging.set_verbosity(optuna.logging.WARNING) # Reduce noise
+    optuna.logging.set_verbosity(optuna.logging.WARNING) 
     
-    # --- NEW: Locked Seed for Replicable Results ---
+    # Locked Seed for Replicable Results
     sampler = optuna.samplers.TPESampler(seed=42)
-    study = optuna.create_study(direction='maximize', sampler=sampler) # maximize neg_mse (closest to 0)
+    study = optuna.create_study(direction='maximize', sampler=sampler) 
     
     study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=50)
     
     print(f"Best Params: {study.best_params}") 
     
-    # 2. TRAIN BEST MODEL
     best_params = study.best_params
-    best_params['n_estimators'] = 200 # Ensure n_estimators is passed
+    best_params['n_estimators'] = 200 
     
     best_model = RandomForestRegressor(**best_params, random_state=42, n_jobs=-1)
     best_model.fit(X_train, y_train)
@@ -274,7 +258,6 @@ def run_training():
     pred_is = best_model.predict(X_train)
     pred_oos = best_model.predict(X_oos)
     
-    # --- NEW SAVING LOGIC (outputs/pred_result) ---
     is_file = PRED_RESULT_DIR / "rf_restricted_pred_is.csv"
     oos_file = PRED_RESULT_DIR / "rf_restricted_pred_oos.csv"
     
@@ -295,3 +278,4 @@ def run_training():
 
 if __name__ == "__main__":
     run_training()
+    

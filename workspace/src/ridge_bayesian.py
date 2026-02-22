@@ -2,7 +2,7 @@
 src/train_ridge_bayes.py
 Ridge Regression Pipeline with BAYESIAN OPTIMIZATION (Optuna):
 1. Loads Data & Fixes Labels (Shift -1)
-2. Engineers Features (Weekends Removed)
+2. Engineers Features (Weekends Removed, RSI, Volume, Macro Pct, Intermediate MA Slopes)
 3. Optimizes Alpha using Optuna (TPE Sampler, Seed 42)
 4. Trains Final Model & Generates Coefficient Plot
 5. Saves Best Model Predictions for Backtest
@@ -18,7 +18,7 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.metrics import r2_score
 from pathlib import Path
 
 # --- CONFIGURATION ---
@@ -36,13 +36,10 @@ LABEL_IS = DATA_DIR / "label_is.csv"
 LABEL_OOS = DATA_DIR / "label_oos.csv"
 
 # Outputs
-REPORT_FILE = OUTPUT_DIR / "oos_report_ridge_bayes.png"
-FORECAST_PLOT_FILE = PLOTS_DIR / "ridge_bayes_forecast.png"
-# --- FIX 1: Defined the missing variable here ---
 COEFF_PLOT_FILE = PLOTS_DIR / "ridge_bayes_coefficients.png" 
 
 # Setup Logging for Optuna
-optuna.logging.set_verbosity(optuna.logging.INFO)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 def keep_close_only(df):
     df = df.copy()
@@ -50,40 +47,64 @@ def keep_close_only(df):
     return df.drop(columns=drop_cols, errors="ignore")
 
 def build_features(df):
-    # Same feature logic as original
+    print("--- Engineering Features (Merged Logic) ---")
     df = df.copy()
-    tradfi_cols = ["IG_NASDAQ_1D__close", "TVC_VIX_1D__close", "TVC_US10Y_1D__close", "TVC_US02Y_1D__close", "ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"]
+    
+    # 1. Forward Fill TradFi
+    tradfi_cols = [
+        "IG_NASDAQ_1D__close", "TVC_VIX_1D__close", 
+        "TVC_US10Y_1D__close", "TVC_US02Y_1D__close", "TVC_US03MY_1D__close",
+        "ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close"
+    ]
     present_tradfi = [c for c in tradfi_cols if c in df.columns]
     df[present_tradfi] = df[present_tradfi].ffill()
     df = df.ffill()
     
     col_btc_close = "BTCUSD__close"
     
-    # Returns / Macro
-    if "IG_NASDAQ_1D__close" in df.columns: df["NASDAQ_ret"] = df["IG_NASDAQ_1D__close"].pct_change()
-    if "TVC_VIX_1D__close" in df.columns: df["VIX_ret"] = df["TVC_VIX_1D__close"].pct_change()
+    # 2. Returns & Macro Changes
+    if "IG_NASDAQ_1D__close" in df.columns: 
+        df["NASDAQ_ret"] = df["IG_NASDAQ_1D__close"].pct_change()
+    if "TVC_VIX_1D__close" in df.columns: 
+        df["VIX_ret"] = df["TVC_VIX_1D__close"].pct_change()
+    if "ECONOMICS_USCBBS_1D__close" in df.columns:
+        df["USCBBS_change"] = df["ECONOMICS_USCBBS_1D__close"].pct_change()
+    if "FRED_M2SL_1D__close" in df.columns:
+        df["M2SL_change"] = df["FRED_M2SL_1D__close"].pct_change()
     
-    # Volume
+    # 3. Volume
     vol_col = next((c for c in ["BTCUSD__volume", "BTCUSD_volume", "volume"] if c in df.columns), None)
     if vol_col:
         df["VOL_REL_MA"] = (df[vol_col] / df[vol_col].rolling(20).mean()) - 1.0
     elif "TVC_VIX_1D__close" in df.columns:
         df["VOL_REL_MA"] = df["TVC_VIX_1D__close"].pct_change()
 
-    # Term Spread
+    # 4. Term Spreads
     if "TVC_US10Y_1D__close" in df.columns and "TVC_US02Y_1D__close" in df.columns:
         df["TERM_10Y_2Y"] = df["TVC_US10Y_1D__close"] - df["TVC_US02Y_1D__close"]
+    if "TVC_US10Y_1D__close" in df.columns and "TVC_US03MY_1D__close" in df.columns:
+        df["TERM_10Y_3M"] = df["TVC_US10Y_1D__close"] - df["TVC_US03MY_1D__close"]
     
-    # Technicals
+    # 5. Technicals (Distances & Intermediate Slopes)
     ma_cols = ["BTCUSD__MA", "BTCUSD__MA.1", "BTCUSD__MA.2", "BTCUSD__MA.3", "BTCUSD__MA.4"]
     present_mas = [c for c in ma_cols if c in df.columns]
+    
     if col_btc_close in df.columns and present_mas:
+        # Distance to MA
         for ma in present_mas:
             df[f"DIST_{ma}"] = (df[col_btc_close] / df[ma]) - 1.0
-        if len(present_mas) >= 2:
-            df["TREND_SLOPE"] = (df[present_mas[0]] - df[present_mas[-1]]) / df[col_btc_close]
+            
+        # Intermediate Slopes (MA1 vs MA2, MA2 vs MA3...)
+        for i in range(len(present_mas) - 1):
+            short_ma = present_mas[i]
+            long_ma = present_mas[i + 1]
+            df[f"SLOPE_{short_ma}_minus_{long_ma}"] = (df[short_ma] - df[long_ma]) / df[col_btc_close]
 
-    # RSI
+        # Mega Slope
+        if len(present_mas) >= 2:
+            df["TREND_SLOPE_MEGA"] = (df[present_mas[0]] - df[present_mas[-1]]) / df[col_btc_close]
+
+    # 6. RSI
     if col_btc_close in df.columns:
         delta = df[col_btc_close].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -91,8 +112,14 @@ def build_features(df):
         rs = gain / loss.replace(0, 0.001)
         df['RSI_14'] = (100 - (100 / (1 + rs))) / 100.0 - 0.5 
 
-    drop_cols = [col_btc_close] + present_tradfi + present_mas + ["ECONOMICS_USCBBS_1D__close", "FRED_M2SL_1D__close", "TVC_US03MY_1D__close"]
-    return df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+    # 7. Cleanup Raw Columns
+    drop_cols = [col_btc_close] + present_tradfi + present_mas 
+    drop_cols += ["ETHBTC_close", "BTCDOMclose", "CRYPTOCAP_USDT_D_1D_close"] # User requested drops
+    
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+    df = df.replace([np.inf, -np.inf], np.nan)
+    
+    return df
 
 def prepare_data():
     print("Loading data...")
@@ -111,13 +138,13 @@ def prepare_data():
     df_oos['split'] = 'test'
     full_df = pd.concat([df_is, df_oos], axis=0).sort_values('time').reset_index(drop=True)
     
-    # --- NEW: Drop Weekends (Days 5 and 6) ---
+    # --- Drop Weekends ---
     print("Removing weekends to reduce forward-fill drag...")
     full_df = full_df[full_df['time'].dt.dayofweek < 5].reset_index(drop=True)
     
     full_df = keep_close_only(full_df)
     
-    # --- FIX DATA LEAKAGE (Critical) ---
+    # --- FIX DATA LEAKAGE ---
     print("Applying Shift(-1) to fix detected Data Leakage...")
     full_df['label'] = full_df['label'].shift(-1)
     
@@ -132,27 +159,20 @@ def prepare_data():
     test_df = full_df[full_df['split'] == 'test'].drop(columns=['split']).copy()
     return train_df, test_df
 
-# --- PLOTTING FUNCTION ---
 def plot_coefficients(pipeline, feature_names):
     """Generates and saves a bar chart of the top 20 Ridge coefficients."""
-    # Extract the Ridge model from the pipeline
     model = pipeline.named_steps['model']
     
-    # Create DataFrame for plotting
     coefs = pd.DataFrame({
         'Feature': feature_names,
         'Coefficient': model.coef_,
         'Abs_Coefficient': np.abs(model.coef_)
     })
     
-    # Sort by absolute impact and take top 20
     coefs = coefs.sort_values('Abs_Coefficient', ascending=False).head(20)
     
     plt.figure(figsize=(12, 8))
-    # Color: Blue for Buy (Positive), Red for Sell (Negative)
     colors = ['#1f77b4' if c > 0 else '#d62728' for c in coefs['Coefficient']]
-    
-    # --- FIX 2: Added hue='Feature' and legend=False to fix Seaborn warning ---
     sns.barplot(x='Coefficient', y='Feature', data=coefs, hue='Feature', palette=colors, legend=False)
     
     plt.title('Top 20 Ridge Coefficients (Bayesian Optimized)', fontsize=14)
@@ -166,9 +186,7 @@ def plot_coefficients(pipeline, feature_names):
     print(f"Coefficient Plot saved to {COEFF_PLOT_FILE}")
     plt.close()
 
-# --- OPTUNA OBJECTIVE FUNCTION ---
 def objective(trial, X, y):
-    # Suggest an alpha value. Log=True explores 0.001 and 0.1 as equally "distant" as 1 and 100
     alpha = trial.suggest_float('alpha', 1e-3, 1e3, log=True)
     
     pipeline = Pipeline([
@@ -176,14 +194,8 @@ def objective(trial, X, y):
         ('model', Ridge(alpha=alpha))
     ])
     
-    # Use TimeSeriesSplit to respect temporal order
     tscv = TimeSeriesSplit(n_splits=5)
-    
-    # Score using Negative MSE (closest proxy to "minimize error")
     scores = cross_val_score(pipeline, X, y, cv=tscv, scoring='neg_mean_squared_error', n_jobs=-1)
-    
-    # Optuna minimizes by default, but cross_val_score returns negative values for error.
-    # We return the MEAN MSE (positive) to minimize.
     return -scores.mean()
 
 def run_bayesian_optimization():
@@ -194,21 +206,14 @@ def run_bayesian_optimization():
     y_train = train_data['label']
     X_oos = oos_features.drop(columns=['time', 'label'], errors='ignore')
     
-    # 1. Create Study
     print("Starting Optuna Study (50 Trials, Seed=42)...")
-    
-    # --- NEW: Seed lock for replicable results ---
     sampler = optuna.samplers.TPESampler(seed=42)
-    study = optuna.create_study(direction='minimize', sampler=sampler) # Minimize MSE
+    study = optuna.create_study(direction='minimize', sampler=sampler)
     
-    # 2. Optimize
-    # We pass X_train and y_train to the objective function using a lambda
     study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=50)
     
     print(f"\nBest Alpha Found: {study.best_params['alpha']:.6f}")
-    print(f"Best Mean CV MSE: {study.best_value:.6f}")
     
-    # 3. Train Final Model with Best Params
     best_alpha = study.best_params['alpha']
     final_pipeline = Pipeline([
         ('scaler', StandardScaler()),
@@ -216,24 +221,19 @@ def run_bayesian_optimization():
     ])
     final_pipeline.fit(X_train, y_train)
     
-    # --- NEW: Generate Coefficient Plot ---
     plot_coefficients(final_pipeline, X_train.columns)
     
-    # 4. Predict
     pred_is = final_pipeline.predict(X_train)
     pred_oos = final_pipeline.predict(X_oos)
     
-    # 5. Save Results (Overwrite ridge_pred_is.csv so backtester picks it up)
     is_file = PRED_RESULT_DIR / "ridge_bayes_pred_is.csv"
     oos_file = PRED_RESULT_DIR / "ridge_bayes_pred_oos.csv"
     
-    # Note: I am naming it ridge_bayes so you can compare it side-by-side if you want
     pd.DataFrame({'time': train_data['time'], 'signal': pred_is}).to_csv(is_file, index=False)
     pd.DataFrame({'time': oos_features['time'], 'signal': pred_oos}).to_csv(oos_file, index=False)
     
     print(f"Predictions saved to:\n - {is_file}\n - {oos_file}")
     
-    # 6. Quick OOS R2 Check
     oos_r2 = r2_score(oos_features['label'], pred_oos)
     print(f"OOS R2: {oos_r2:.5f}")
 
