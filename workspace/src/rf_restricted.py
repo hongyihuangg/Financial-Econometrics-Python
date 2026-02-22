@@ -136,6 +136,10 @@ def prepare_data():
     df_oos['split'] = 'test'
     full_df = pd.concat([df_is, df_oos], axis=0).sort_values('time').reset_index(drop=True)
     
+    # --- NEW: Drop Weekends (Days 5 and 6) ---
+    print("Removing weekends to reduce forward-fill drag...")
+    full_df = full_df[full_df['time'].dt.dayofweek < 5].reset_index(drop=True)
+    
     full_df = keep_close_only(full_df)
     
     # --- FIX DATA LEAKAGE HERE ---
@@ -251,7 +255,11 @@ def run_training():
     # 1. OPTUNA BAYESIAN SEARCH
     print("Starting Optuna Study (50 trials)...")
     optuna.logging.set_verbosity(optuna.logging.WARNING) # Reduce noise
-    study = optuna.create_study(direction='maximize') # maximize neg_mse (closest to 0)
+    
+    # --- NEW: Locked Seed for Replicable Results ---
+    sampler = optuna.samplers.TPESampler(seed=42)
+    study = optuna.create_study(direction='maximize', sampler=sampler) # maximize neg_mse (closest to 0)
+    
     study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=50)
     
     print(f"Best Params: {study.best_params}") 

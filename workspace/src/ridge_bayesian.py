@@ -2,8 +2,8 @@
 src/train_ridge_bayes.py
 Ridge Regression Pipeline with BAYESIAN OPTIMIZATION (Optuna):
 1. Loads Data & Fixes Labels (Shift -1)
-2. Engineers Features
-3. Optimizes Alpha using Optuna (TPE Sampler)
+2. Engineers Features (Weekends Removed)
+3. Optimizes Alpha using Optuna (TPE Sampler, Seed 42)
 4. Trains Final Model & Generates Coefficient Plot
 5. Saves Best Model Predictions for Backtest
 """
@@ -110,6 +110,11 @@ def prepare_data():
     df_is['split'] = 'train'
     df_oos['split'] = 'test'
     full_df = pd.concat([df_is, df_oos], axis=0).sort_values('time').reset_index(drop=True)
+    
+    # --- NEW: Drop Weekends (Days 5 and 6) ---
+    print("Removing weekends to reduce forward-fill drag...")
+    full_df = full_df[full_df['time'].dt.dayofweek < 5].reset_index(drop=True)
+    
     full_df = keep_close_only(full_df)
     
     # --- FIX DATA LEAKAGE (Critical) ---
@@ -190,8 +195,11 @@ def run_bayesian_optimization():
     X_oos = oos_features.drop(columns=['time', 'label'], errors='ignore')
     
     # 1. Create Study
-    print("Starting Optuna Study (50 Trials)...")
-    study = optuna.create_study(direction='minimize') # Minimize MSE
+    print("Starting Optuna Study (50 Trials, Seed=42)...")
+    
+    # --- NEW: Seed lock for replicable results ---
+    sampler = optuna.samplers.TPESampler(seed=42)
+    study = optuna.create_study(direction='minimize', sampler=sampler) # Minimize MSE
     
     # 2. Optimize
     # We pass X_train and y_train to the objective function using a lambda
